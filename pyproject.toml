@@ -11,6 +11,10 @@ dependencies = [
     # pod_annotations). The multiplication backend + manifests + docs target this 0.5.x warmpool/v1beta1
     # model. The cluster's AGENT_SANDBOX_VERSION controller must serve v1beta1 to match.
     "k8s-agent-sandbox>=0.5.0,<0.6",
+    # Warm-pool orchestration for the mini_swe_agent_2 example (per-image SandboxTemplate/WarmPool,
+    # claims, preflight). Lives in the agent-sandbox repo as an example package, not on PyPI — pulled
+    # straight from upstream via [tool.uv.sources] below, pinned to the commit that introduced it.
+    "agent-sandbox-rl",
     "kubernetes>=27.2.0",
     "mini-swe-agent>=1.12.0,<2",
     "litellm",
@@ -66,6 +70,9 @@ explicit = true
 [tool.uv.sources]
 # Pin SkyRL to the source whose example code this repo copied (PyPI 'skyrl' is a 0.0.1 placeholder):
 skyrl = { git = "https://github.com/NovaSky-AI/SkyRL.git", rev = "6c300c75" }
+# agent-sandbox-rl merged upstream in kubernetes-sigs/agent-sandbox#1000; pin that commit. It reuses
+# (doesn't fork) the k8s-agent-sandbox SDK, so the PyPI 0.5.x pin above still governs the SDK.
+agent-sandbox-rl = { git = "https://github.com/kubernetes-sigs/agent-sandbox.git", subdirectory = "examples/agent-sandbox-rl", rev = "a1a58a019a5479ec6cd77f95234927da7a1f434d" }
 flashinfer-jit-cache = { index = "flashinfer-cu128", marker = "sys_platform == 'linux'" }
 vllm = [{ index = "vllm-cu129", marker = "sys_platform == 'linux'" }]
 flash-attn = { url = "https://github.com/erictang000/flash-attention/releases/download/v2.8.3-torch2.11-clean/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }

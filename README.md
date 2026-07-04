@@ -3,18 +3,24 @@
 Run [SkyRL](https://github.com/NovaSky-AI/SkyRL) RL workloads on the
 [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) backend (GKE) for environment rollouts. Each rollout occurs in a gvisor-isolated gke sandbox.
 
-The repo contains two examples, one per package folder, that use **agent-sandbox** in two different ways:
+The repo contains three examples, one per package folder, that use **agent-sandbox** in different ways:
 
 
-| | [`skyrl_sandbox/mini_swe_agent`](skyrl_sandbox/mini_swe_agent) | [`skyrl_sandbox/multiplication`](skyrl_sandbox/multiplication) |
-|---|---|---|
-| task | [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) SWE-bench | toy `a * b` |
-| image | **per-instance** (thousands) | **one fixed** image |
-| create | raw `Sandbox` CR (no template) | SDK `create_sandbox(warmpool=…)` → pool → template |
-| execute | Kubernetes **pod-exec** | SDK **`commands.run`** (in-image `:8888`) |
-| needs `:8888` runtime image? | no | **yes** |
+| | [`skyrl_sandbox/mini_swe_agent`](skyrl_sandbox/mini_swe_agent) | [`skyrl_sandbox/mini_swe_agent_2`](skyrl_sandbox/mini_swe_agent_2) | [`skyrl_sandbox/multiplication`](skyrl_sandbox/multiplication) |
+|---|---|---|---|
+| task | [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) SWE-bench | same | toy `a * b` |
+| image | **per-instance** (thousands) | **per-instance** (thousands) | **one fixed** image |
+| create | raw `Sandbox` CR (no template, cold start per trajectory) | [agent-sandbox-rl](https://github.com/kubernetes-sigs/agent-sandbox/tree/main/examples/agent-sandbox-rl) fleet: **warm pool per image**, sized to `max_concurrent` → claim per trajectory | SDK `create_sandbox(warmpool=…)` → pool → template |
+| execute | Kubernetes **pod-exec** | Kubernetes **pod-exec** | SDK **`commands.run`** (in-image `:8888`) |
+| needs `:8888` runtime image? | no | no | **yes** |
 
-The sandbox backends for mini-swe-agent and multiplication are different due to how warmpools work in agent-sandbox. In a simple sense, agent-sandbox allows users to create a warmpool of sandboxes of a certain docker image and reuses them for agent rollouts. Mini-swe-agent has a separate docker image per environment, so this model of using an SDK cannot be used. Instead, raw Kubernetes APIs have to be used to operate with sandboxes.
+The two mini-swe-agent generations exist because of how warm pools work in agent-sandbox: a pool serves ONE
+image, and mini-swe-agent has a separate docker image per instance, so gen-1 fell back to raw per-trajectory
+`Sandbox` CRs (no pooling, cold image pull + pod start on every rollout). The GKE team's **agent-sandbox-rl**
+package removes that limitation by managing a SandboxTemplate + SandboxWarmPool **per image**, sized to a
+concurrency budget rather than task count — gen-2 delegates all sandbox orchestration to it, so a GRPO group
+(`n_samples_per_prompt` rollouts of one instance = one image) draws warm pods from a shared pool, and gets
+preflight/pre-pull/run-reports for free. Gen-1 is kept as the raw-CR reference implementation.
 
 Across both, the Ray workers (driving the sandboxes) hold the Kubernetes identity/RBAC; the sandbox
 pods run untrusted model code with **no** API token and gVisor isolation (`infra/05-setup-rbac.sh`).
@@ -54,7 +60,34 @@ Backend selected by `environment_class:
 [`configs/mini_swe_agent/swebench_agent_sandbox.yaml`](configs/mini_swe_agent/swebench_agent_sandbox.yaml).
 The example targets the mini-swe-agent **1.x** API, so `pyproject.toml` pins `mini-swe-agent<2`.
 
-## Example 2 — multiplication (single image, agent-sandbox SDK)
+## Example 2 — mini-swe-agent gen-2 (SWE-bench, agent-sandbox-rl warm pools)
+
+Same task, dataset, LLM suite, and generator interface as Example 1 — only the sandbox backend changes:
+`MiniSweAgent2Generator` builds one `AsyncSandboxFleet` and lets `fleet.run(...)` warm per-image pools,
+claim a sandbox per rollout (plus a **fresh** one per eval), and tear everything down each batch. Fleet
+knobs (namespace, `max_concurrent`, `warmpool_strategy: sliding|naive|none`, gVisor placement) live in the
+`environment:` block of
+[`configs/mini_swe_agent_2/swebench_agent_sandbox_rl.yaml`](configs/mini_swe_agent_2/swebench_agent_sandbox_rl.yaml)
+— consumed by this package, not by mini-swe-agent's env factory, since the fleet is shared across
+trajectories. Rollouts run as asyncio tasks in the generator process (no per-trajectory Ray task: a fleet
+holds kube clients + claim bookkeeping and can't be shipped to Ray workers).
+
+```bash
+# data: same parquet as Example 1 (skyrl_sandbox.mini_swe_agent.preprocess)
+# train (GPUs)
+bash scripts/mini_swe_agent_2/run_mini_swe_agent_sandbox.sh
+# OR generate-only against Fireworks (no GPUs):
+FIREWORKS_AI_API_KEY=fw-... bash scripts/mini_swe_agent_2/run_generate_fireworks.sh
+```
+
+`agent-sandbox-rl` isn't on PyPI; `pyproject.toml` pins it straight from the agent-sandbox repo
+(`[tool.uv.sources]`, upstream PR #1000). **On clusters created before this example, re-run
+`infra/05-setup-rbac.sh`**: the fleet additionally needs create/delete on SandboxTemplates/WarmPools and
+cluster-scoped reads (CRDs, RuntimeClasses) for its preflight. Known deltas vs gen-1: template pods carry
+resource **requests only** (no limits/ephemeral-storage — upstream `TemplateSpec` gap), and `cwd`/`env`
+are folded into each exec instead of baked into the pod.
+
+## Example 3 — multiplication (single image, agent-sandbox SDK)
 
 ```bash
 # data
@@ -82,10 +115,11 @@ in the manifest on purpose — there is no published default; build it from agen
 
 ## Testing the agent-sandbox part (no GPUs)
 
-Validate the mini-swe sandbox contract on a cheap **CPU** cluster — no H100s, no SkyRL training:
+Validate the mini-swe sandbox contracts on a cheap **CPU** cluster — no H100s, no SkyRL training:
 ```bash
 cd infra && ASSUME_YES=1 ./up-smoke.sh    # CPU cluster + gVisor sandbox pool + agent-sandbox + RBAC (no GPU/KubeRay)
-cd .. && bash scripts/mini_swe_agent/run_smoke_in_pod.sh   # runs IN-CLUSTER as the runner SA (RBAC + gVisor exercised)
+cd .. && bash scripts/mini_swe_agent/run_smoke_in_pod.sh     # gen-1: raw Sandbox CR create → execute() → cleanup
+bash scripts/mini_swe_agent_2/run_smoke_in_pod.sh            # gen-2: fleet preflight → warm pool → claim → execute() → fresh-box reclaim → teardown
 # teardown:  ASSUME_YES=1 infra/teardown-smoke.sh
 ```
 `run_smoke_in_pod.sh` runs the test from a pod as `skyrl-sandbox-runner`, so create → `execute()` →

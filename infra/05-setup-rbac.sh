@@ -60,9 +60,17 @@ rules:
 - apiGroups: ["extensions.agents.x-k8s.io"]
   resources: ["sandboxclaims"]
   verbs: ["create", "get", "list", "watch", "delete"]
+# agent-sandbox-rl fleet path (mini_swe_agent_2 backend): the fleet CREATES a SandboxTemplate +
+# SandboxWarmPool per SWE-bench image and deletes them at teardown (the SDK path above only READ a
+# pre-applied pool/template, hence the old read-only rule).
 - apiGroups: ["extensions.agents.x-k8s.io"]
   resources: ["sandboxwarmpools", "sandboxtemplates"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+# Fleet preflight reads the target namespace (warn-only check; a namespaced Role can grant get on
+# the namespace object itself).
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get"]
 # Read pod state (wait for Ready before exec) ...
 - apiGroups: [""]
   resources: ["pods"]
@@ -91,6 +99,64 @@ roleRef:
   kind: Role
   name: sandbox-runner
   apiGroup: rbac.authorization.k8s.io
+---
+# Cluster-scoped READ-ONLY bits for the agent-sandbox-rl fleet (mini_swe_agent_2 backend). Its
+# preflight HARD-FAILS without: CRD version discovery (are the v1beta1 extensions served?) and the
+# gVisor RuntimeClass check. Nodes read only feeds the best-effort RunReport environment block.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbox-runner-cluster-read
+rules:
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get"]
+- apiGroups: ["node.k8s.io"]
+  resources: ["runtimeclasses"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbox-runner-cluster-read
+subjects:
+- kind: ServiceAccount
+  name: ${SANDBOX_RUNNER_SA}
+  namespace: ${RAY_NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: sandbox-runner-cluster-read
+  apiGroup: rbac.authorization.k8s.io
+---
+# Warn-only fleet preflight check: is the agent-sandbox controller Deployment ready? Grant the one
+# read it needs so in-pod runs stay warning-free (scoped to that single deployment).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-runner-controller-read
+  namespace: agent-sandbox-system
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  resourceNames: ["agent-sandbox-controller"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-runner-controller-read
+  namespace: agent-sandbox-system
+subjects:
+- kind: ServiceAccount
+  name: ${SANDBOX_RUNNER_SA}
+  namespace: ${RAY_NAMESPACE}
+roleRef:
+  kind: Role
+  name: sandbox-runner-controller-read
+  apiGroup: rbac.authorization.k8s.io
 YAML
 
 log "Applying RBAC..."
@@ -107,6 +173,12 @@ kubectl auth can-i delete sandboxes.agents.x-k8s.io --as="$subj" -n "$SANDBOX_NA
   && ok "  can delete Sandboxes" || warn "  CANNOT delete Sandboxes"
 kubectl auth can-i create sandboxclaims.extensions.agents.x-k8s.io --as="$subj" -n "$SANDBOX_NAMESPACE" \
   && ok "  can create SandboxClaims (SDK warm-pool path)" || warn "  CANNOT create SandboxClaims (multiplication SDK path will 403)"
+kubectl auth can-i create sandboxwarmpools.extensions.agents.x-k8s.io --as="$subj" -n "$SANDBOX_NAMESPACE" \
+  && ok "  can create SandboxWarmPools (mini_swe_agent_2 fleet path)" || warn "  CANNOT create SandboxWarmPools (mini_swe_agent_2 fleet will 403)"
+kubectl auth can-i get customresourcedefinitions.apiextensions.k8s.io --as="$subj" \
+  && ok "  can read CRDs (fleet preflight)" || warn "  CANNOT read CRDs (mini_swe_agent_2 fleet preflight will fail)"
+kubectl auth can-i get runtimeclasses.node.k8s.io --as="$subj" \
+  && ok "  can read RuntimeClasses (fleet preflight, gVisor check)" || warn "  CANNOT read RuntimeClasses (fleet preflight will fail when runtime_class is set)"
 # Negative check: the runner must NOT have cluster-wide power.
 if kubectl auth can-i create pods --subresource=exec --as="$subj" -n kube-system >/dev/null 2>&1; then
   warn "  runner can exec in kube-system — RBAC is too broad (expected: no)."
